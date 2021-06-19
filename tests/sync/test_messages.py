@@ -38,12 +38,14 @@ class AssemblerTests(ThreadTestCase):
 
         """
         self.assertFalse(self.assembler.mutex.locked())
-        self.assertFalse(self.assembler.message_complete.is_set())
-        self.assertFalse(self.assembler.message_fetched.is_set())
         self.assertFalse(self.assembler.get_in_progress)
-        self.assertIsNone(self.assembler.decoder)
-        self.assertEqual(self.assembler.chunks, [])
-        self.assertIsNone(self.assembler.chunks_queue)
+        self.assertFalse(self.assembler.put_in_progress)
+        if not self.assembler.closed:
+            self.assertFalse(self.assembler.message_complete.is_set())
+            self.assertFalse(self.assembler.message_fetched.is_set())
+            self.assertIsNone(self.assembler.decoder)
+            self.assertEqual(self.assembler.chunks, [])
+            self.assertIsNone(self.assembler.chunks_queue)
 
     def test_get_text_message_already_received(self):
         def putter():
@@ -338,24 +340,79 @@ class AssemblerTests(ThreadTestCase):
 
     def test_get_fails_when_get_is_running(self):
         with self.run_in_thread(self.assembler.get):
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(RuntimeError):
                 self.assembler.get()
             self.assembler.put(Frame(OP_TEXT, b""))  # unlock other thread
 
     def test_get_fails_when_get_iter_is_running(self):
         with self.run_in_thread(lambda: list(self.assembler.get_iter())):
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(RuntimeError):
                 self.assembler.get()
             self.assembler.put(Frame(OP_TEXT, b""))  # unlock other thread
 
     def test_get_iter_fails_when_get_is_running(self):
         with self.run_in_thread(self.assembler.get):
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(RuntimeError):
                 list(self.assembler.get_iter())
             self.assembler.put(Frame(OP_TEXT, b""))  # unlock other thread
 
     def test_get_iter_fails_when_get_iter_is_running(self):
         with self.run_in_thread(lambda: list(self.assembler.get_iter())):
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(RuntimeError):
                 list(self.assembler.get_iter())
             self.assembler.put(Frame(OP_TEXT, b""))  # unlock other thread
+
+    def test_put_fails_when_put_is_running(self):
+        def putter():
+            self.assembler.put(Frame(OP_TEXT, b"caf\xc3\xa9"))
+
+        with self.run_in_thread(putter):
+            with self.assertRaises(RuntimeError):
+                self.assembler.put(Frame(OP_BINARY, b"tea"))
+            self.assembler.get()  # unblock other thread
+
+    def test_get_fails_when_interrupted_by_close(self):
+        def closer():
+            time.sleep(2 * MS)
+            self.assembler.close()
+
+        with self.run_in_thread(closer):
+            with self.assertRaises(EOFError):
+                self.assembler.get()
+
+    def test_get_iter_fails_when_interrupted_by_close(self):
+        def closer():
+            time.sleep(2 * MS)
+            self.assembler.close()
+
+        with self.run_in_thread(closer):
+            with self.assertRaises(EOFError):
+                list(self.assembler.get_iter())
+
+    def test_put_fails_when_interrupted_by_close(self):
+        def closer():
+            time.sleep(2 * MS)
+            self.assembler.close()
+
+        with self.run_in_thread(closer):
+            with self.assertRaises(EOFError):
+                self.assembler.put(Frame(OP_TEXT, b"caf\xc3\xa9"))
+
+    def test_get_fails_after_close(self):
+        self.assembler.close()
+        with self.assertRaises(EOFError):
+            self.assembler.get()
+
+    def test_get_iter_fails_after_close(self):
+        self.assembler.close()
+        with self.assertRaises(EOFError):
+            list(self.assembler.get_iter())
+
+    def test_put_fails_after_close(self):
+        self.assembler.close()
+        with self.assertRaises(EOFError):
+            self.assembler.put(Frame(OP_TEXT, b"caf\xc3\xa9"))
+
+    def test_close_is_idempotent(self):
+        self.assembler.close()
+        self.assembler.close()

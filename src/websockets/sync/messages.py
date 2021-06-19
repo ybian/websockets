@@ -33,8 +33,10 @@ class Assembler:
         self.message_fetched = threading.Event()
 
         # This flag prevents concurrent calls to get() by user code.
-        # (There's no similar flag for put() because we trust library code.)
         self.get_in_progress = False
+
+        # This flag prevents concurrent calls to put() by library code.
+        self.put_in_progress = False
 
         # Decoder for text frames, None for binary frames.
         self.decoder: Optional[codecs.IncrementalDecoder] = None
@@ -51,6 +53,9 @@ class Assembler:
         # Stream data from frames belonging to the same message.
         self.chunks_queue: Optional[queue.SimpleQueue[Optional[Data]]] = None
 
+        # This flag marks the end of the stream.
+        self.closed = False
+
     def get(self, timeout: Optional[float] = None) -> Optional[Data]:
         """
         Read the next message.
@@ -63,9 +68,17 @@ class Assembler:
         If ``timeout`` is set and elapses before a complete message is
         received, :meth:`get` returns ``None``.
 
+        :raises EOFError: if the stream of frames has ended
+        :raises RuntimeError: if two threads call get or get_iter concurrently
+
         """
         with self.mutex:
-            assert not self.get_in_progress
+            if self.closed:
+                raise EOFError("stream of frames ended")
+
+            if self.get_in_progress:
+                raise RuntimeError("get or get_iter is already running")
+
             self.get_in_progress = True
 
         # If the message_complete event isn't set yet, release the lock to
@@ -74,12 +87,14 @@ class Assembler:
         completed = self.message_complete.wait(timeout)
 
         with self.mutex:
-            assert self.get_in_progress
             self.get_in_progress = False
 
             # Waiting for a complete messsage timed out.
             if not completed:
                 return None
+
+            if self.closed:
+                raise EOFError("stream of frames ended")
 
             assert self.message_complete.is_set()
             self.message_complete.clear()
@@ -103,10 +118,16 @@ class Assembler:
         Iterating the return value of :meth:`get_iter` yields a :class:`str`
         or :class:`bytes` for each frame in the message.
 
+        :raises EOFError: if the stream of frames has ended
+        :raises RuntimeError: if two threads call get or get_iter concurrently
+
         """
         with self.mutex:
-            assert not self.get_in_progress
-            self.get_in_progress = True
+            if self.closed:
+                raise EOFError("stream of frames ended")
+
+            if self.get_in_progress:
+                raise RuntimeError("get or get_iter is already running")
 
             chunks = self.chunks
             self.chunks = []
@@ -120,6 +141,8 @@ class Assembler:
             if self.message_complete.is_set():
                 self.chunks_queue.put(None)
 
+            self.get_in_progress = True
+
         # Locking with get_in_progress ensures only one thread can get here.
         yield from chunks
         while True:
@@ -129,11 +152,13 @@ class Assembler:
             yield chunk
 
         with self.mutex:
-            assert self.get_in_progress
             self.get_in_progress = False
 
             assert self.message_complete.is_set()
             self.message_complete.clear()
+
+            if self.closed:
+                raise EOFError("stream of frames ended")
 
             assert not self.message_fetched.is_set()
             self.message_fetched.set()
@@ -152,8 +177,17 @@ class Assembler:
         :meth:`put` assumes that the stream of frames respects the protocol.
         If it doesn't, the behavior is undefined.
 
+        :raises EOFError: if the stream of frames has ended
+        :raises RuntimeError: if two threads call put concurrently
+
         """
         with self.mutex:
+            if self.closed:
+                raise EOFError("stream of frames ended")
+
+            if self.put_in_progress:
+                raise RuntimeError("put is already running")
+
             if frame.opcode is Opcode.TEXT:
                 self.decoder = UTF8Decoder(errors="strict")
             elif frame.opcode is Opcode.BINARY:
@@ -180,18 +214,50 @@ class Assembler:
 
             # Message is complete. Wait until it's fetched to return.
 
+            assert not self.message_complete.is_set()
+            self.message_complete.set()
+
             if self.chunks_queue is not None:
                 self.chunks_queue.put(None)
 
-            assert not self.message_complete.is_set()
-            self.message_complete.set()
             assert not self.message_fetched.is_set()
+
+            self.put_in_progress = True
 
         # Release the lock to allow get() to run and eventually set the event.
         self.message_fetched.wait()
 
         with self.mutex:
+            self.put_in_progress = False
+
             assert self.message_fetched.is_set()
             self.message_fetched.clear()
 
+            if self.closed:
+                raise EOFError("stream of frames ended")
+
             self.decoder = None
+
+    def close(self) -> None:
+        """
+        End the stream of frames.
+
+        Callling :meth:`close` concurrently with :meth:`get`, :meth:`get_iter`, or
+        :meth:`put` is safe.
+
+        """
+        with self.mutex:
+            if self.closed:
+                return
+
+            self.closed = True
+
+            # Unblock get() or get_iter()
+            if self.get_in_progress:
+                self.message_complete.set()
+                if self.chunks_queue is not None:
+                    self.chunks_queue.put(None)
+
+            # Unblock put()
+            if self.put_in_progress:
+                self.message_fetched.set()
